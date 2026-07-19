@@ -1,0 +1,47 @@
+[
+  {
+  "junction_id": "J1",
+  "location": "Guindy",
+  "latitude": 13.0067,
+  "longitude": 80.2206,
+  "lanes": [
+    {"lane_id": "L1", "direction": ["left"], "video": "j1_lane1.mp4"},
+    {"lane_id": "L2", "direction": ["straight"], "video": "j1_lane2.mp4"},
+    {"lane_id": "L3", "direction": ["straight", "right"], "video": "j1_lane3.mp4"}
+  ]
+},
+  {
+    "junction_id": "J2",
+    "location": "Kathipara",
+    "latitude": 13.0108,
+    "longitude": 80.2037,
+    "lanes": [
+      {"lane_id": "L1", "direction": ["left"], "video": "j2_lane1.mp4"},
+      {"lane_id": "L2", "direction": ["straight"], "video": "j2_lane2.mp4"},
+      {"lane_id": "L3", "direction": ["right"], "video": "j2_lane3.mp4"}
+    ]
+  },
+  {
+    "junction_id": "J3",
+    "location": "Teynampet",
+    "latitude": 13.0418,
+    "longitude": 80.2472,
+    "lanes": [
+      {"lane_id": "L1", "direction": ["left"], "video": "j3_lane1.mp4"},
+      {"lane_id": "L2", "direction": ["straight"], "video": "j3_lane2.mp4"},
+      {"lane_id": "L3", "direction": ["right"], "video": "j3_lane3.mp4"}
+    ]
+  },
+
+  {
+  "junction_id": "J4",
+  "location": "Demo",
+  "latitude": 13.1200,
+  "longitude": 80.2100,
+  "lanes": [
+    {"lane_id":"L1","direction":["left"]},
+    {"lane_id":"L2","direction":["straight"]},
+    {"lane_id":"L3","direction":["right"]}
+  ]
+}
+]
