@@ -10,6 +10,7 @@ let isSpeaking = false;
 let currentAudio = null;
 let playbackQueue = [];
 let isProcessingQueue = false;
+let currentPlayingLanguage = ''; // Track which language is playing
 
 // Advisory tracking to prevent repetition
 let lastAdvisoryHash = {
@@ -17,6 +18,10 @@ let lastAdvisoryHash = {
   english: '',
   hindi: ''
 };
+
+// Track latest advisory to ignore outdated requests
+let latestAdvisoryHash = '';
+let pendingAdvisoryHash = '';
 
 // User interaction flag for autoplay
 let userInteracted = false;
@@ -76,12 +81,22 @@ export const cancelSpeech = () => {
   playbackQueue = [];
   isProcessingQueue = false;
   isSpeaking = false;
+  currentPlayingLanguage = '';
+  
+  // Clear pending advisory
+  pendingAdvisoryHash = '';
+  window.__pendingAdvisory = null;
 };
 
 /**
  * Check if currently speaking
  */
 export const getIsSpeaking = () => isSpeaking;
+
+/**
+ * Get currently playing language
+ */
+export const getCurrentLanguage = () => currentPlayingLanguage;
 
 /**
  * Check if autoplay is blocked
@@ -106,6 +121,7 @@ const playMP3 = (url, language) => {
       const audio = new Audio(url);
       currentAudio = audio;
       isSpeaking = true;
+      currentPlayingLanguage = language; // Track current language
 
       audio.onloadeddata = () => {
         console.log(`Audio loaded for ${language}, duration: ${audio.duration}s`);
@@ -115,6 +131,7 @@ const playMP3 = (url, language) => {
         console.log(`Audio playback completed for ${language}`);
         isSpeaking = false;
         currentAudio = null;
+        currentPlayingLanguage = '';
         resolve();
       };
 
@@ -122,6 +139,7 @@ const playMP3 = (url, language) => {
         console.error(`Audio playback error for ${language}:`, error);
         isSpeaking = false;
         currentAudio = null;
+        currentPlayingLanguage = '';
         reject(new Error(`Failed to play ${language} audio`));
       };
 
@@ -140,10 +158,12 @@ const playMP3 = (url, language) => {
             console.warn('Autoplay blocked by browser. User interaction required.');
             isSpeaking = false;
             currentAudio = null;
+            currentPlayingLanguage = '';
             reject(new Error('AUTOPLAY_BLOCKED'));
           } else {
             isSpeaking = false;
             currentAudio = null;
+            currentPlayingLanguage = '';
             reject(error);
           }
         });
@@ -152,6 +172,7 @@ const playMP3 = (url, language) => {
       console.error(`Exception playing ${language}:`, error);
       isSpeaking = false;
       currentAudio = null;
+      currentPlayingLanguage = '';
       reject(error);
     }
   });
@@ -186,6 +207,16 @@ const processQueue = async () => {
   }
 
   isProcessingQueue = false;
+  
+  // After completing playback, check if there's a pending advisory
+  if (pendingAdvisoryHash && window.__pendingAdvisory) {
+    console.log('Playing pending advisory after current sequence completed');
+    const pending = window.__pendingAdvisory;
+    window.__pendingAdvisory = null;
+    pendingAdvisoryHash = '';
+    // Small delay before playing next advisory
+    setTimeout(() => speakSequential(pending, false), 500);
+  }
 };
 
 /**
@@ -224,6 +255,9 @@ export const speakSequential = async (advisory, force = false) => {
     hindi: hashText(hindi)
   };
 
+  // Generate combined hash for this advisory
+  const combinedHash = `${currentHash.tamil}-${currentHash.english}-${currentHash.hindi}`;
+
   // Check if advisory has changed
   const tamilChanged = currentHash.tamil !== lastAdvisoryHash.tamil && tamil;
   const englishChanged = currentHash.english !== lastAdvisoryHash.english && english;
@@ -234,13 +268,23 @@ export const speakSequential = async (advisory, force = false) => {
     return;
   }
 
-  // If already playing, don't interrupt
+  // If already playing, store this as the latest pending advisory
   if (isSpeaking || isProcessingQueue) {
-    console.log('Audio already playing, skipping duplicate request');
+    // Only update if this is newer than current pending
+    if (combinedHash !== latestAdvisoryHash) {
+      console.log('Audio already playing, queuing latest advisory');
+      pendingAdvisoryHash = combinedHash;
+      // Store the advisory for later playback
+      window.__pendingAdvisory = advisory;
+    }
     return;
   }
 
   console.log('New advisory detected, starting sequential playback');
+
+  // Mark this as the latest advisory being played
+  latestAdvisoryHash = combinedHash;
+  pendingAdvisoryHash = '';
 
   // Update last advisory hashes
   if (tamil) lastAdvisoryHash.tamil = currentHash.tamil;
