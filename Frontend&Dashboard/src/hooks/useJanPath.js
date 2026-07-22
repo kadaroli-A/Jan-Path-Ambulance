@@ -10,7 +10,6 @@ export const useJanPath = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
-  const [initialized, setInitialized] = useState(true);
   
   const pollingIntervalRef = useRef(null);
   const isMountedRef = useRef(true);
@@ -30,7 +29,6 @@ export const useJanPath = () => {
       );
       
       console.log('✅ Ambulance initialized successfully:', response.data);
-      setInitialized(true);
       setConnectionStatus('connected');
       return true;
     } catch (err) {
@@ -141,6 +139,7 @@ export const useJanPath = () => {
         clearInterval(pollingIntervalRef.current);
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return {
