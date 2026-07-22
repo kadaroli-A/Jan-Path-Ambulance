@@ -1,28 +1,37 @@
+import json
+import logging
+import math
+import os
+import threading
+import time
+import random
+import hashlib
+from datetime import datetime
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List
 from backend.services.yolo_service import run_yolo_nth_frame
 from backend.services.incident_report import (
-    initialize_report,
-    record_junction_activation,
-    record_lane_selection,
-    record_high_urgency,
     finalize_report,
     get_report,
-    reset_report
+    initialize_report,
+    record_high_urgency,
+    record_junction_activation,
+    record_lane_selection,
+    reset_report,
 )
 from backend.services.tts_service import generate_multilingual_tts
-from fastapi.responses import FileResponse
-from datetime import datetime
-import time
-import json
-import math
-import random
-import os
-import threading
 
 DEBUG = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("janpath")
 
 
 def debug_print(*args):
@@ -86,6 +95,12 @@ class AmbulanceState(BaseModel):
 
 AMBULANCE_STORE = {}
 AMBULANCE_LOCK = threading.Lock()
+ADVISORY_LOCK = threading.Lock()
+LAST_ADVISORY_HASH = None
+GENERATION_LOCKS = {}
+GENERATION_LOCKS_LOCK = threading.Lock()
+
+AUDIO_DIR = os.path.join(BASE_DIR, "audio")
 
 def simulate_ambulance():
     while True:
@@ -285,16 +300,6 @@ def get_ambulance(ambulance_id: str):
 # DIRECTION DETECTION
 # =========================================================
 
-def get_direction(ambulance, junction):
-
-    dx = junction["longitude"] - ambulance.longitude
-    dy = junction["latitude"] - ambulance.latitude
-
-    if abs(dx) > abs(dy):
-        return "right" if dx > 0 else "left"
-
-    return "straight"
-
 def get_route_direction(current_junction, next_junction):
 
     dx = next_junction["longitude"] - current_junction["longitude"]
@@ -373,44 +378,6 @@ def default_direction_lane(valid_lanes):
         return None
 
     return valid_lanes[0]["lane_id"]
-
-# =========================================================
-# BEST LANE
-# =========================================================
-
-def select_best_lane(valid_lanes):
-
-    if not valid_lanes:
-        return None, {}, "HIGH"
-
-    lane_occupancy = {}
-
-    for lane in valid_lanes:
-        lane_occupancy[lane["lane_id"]] = get_lane_occupancy(lane)
-
-    valid_counts = {
-        k: v
-        for k, v in lane_occupancy.items()
-        if v is not None
-    }
-
-    if valid_counts:
-        selected_lane = min(
-            valid_counts.items(),
-            key=lambda x: (x[1], x[0])
-        )[0]
-    else:
-        selected_lane = default_direction_lane(valid_lanes)
-
-    urgency = "NORMAL"
-
-    if valid_counts and all(
-        o > CONGESTION_THRESHOLD
-        for o in valid_counts.values()
-    ):
-        urgency = "HIGH"
-
-    return selected_lane, lane_occupancy, urgency
 
 # =========================================================
 # SIGNAL ACTION
@@ -574,16 +541,136 @@ def calculate_eta(distance_km, speed_kmph):
     return round(eta)
 
 
+def hash_advisory(advisory):
+    try:
+        advisory_json = json.dumps(
+            advisory,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except Exception:
+        advisory_json = str(advisory)
+
+    return hashlib.sha256(
+        advisory_json.encode("utf-8")
+    ).hexdigest()
+
+
+def _audio_paths():
+    return [
+        os.path.join(AUDIO_DIR, f"advisory_{lang}.mp3")
+        for lang in ["tamil", "english", "hindi"]
+    ]
+
+
+def _all_audio_exists():
+    return all(os.path.exists(path) for path in _audio_paths())
+
+
+def _acquire_generation_lock(advisory_hash):
+    with GENERATION_LOCKS_LOCK:
+        lock = GENERATION_LOCKS.get(advisory_hash)
+        if lock is None:
+            lock = threading.Lock()
+            GENERATION_LOCKS[advisory_hash] = lock
+    return lock.acquire(blocking=False)
+
+
+def _release_generation_lock(advisory_hash):
+    with GENERATION_LOCKS_LOCK:
+        lock = GENERATION_LOCKS.get(advisory_hash)
+    if lock is None:
+        return
+    try:
+        lock.release()
+    except RuntimeError:
+        pass
+    with GENERATION_LOCKS_LOCK:
+        if not lock.locked():
+            GENERATION_LOCKS.pop(advisory_hash, None)
+
+
+def _generate_tts_with_hash(advisory, advisory_hash):
+    import threading
+    import traceback
+    print(f"[BACKGROUND THREAD {threading.get_ident()}] Thread started", flush=True)
+    try:
+        print(f"[BACKGROUND THREAD {threading.get_ident()}] Calling generate_multilingual_tts()", flush=True)
+        generated = generate_multilingual_tts(advisory)
+        print(f"[BACKGROUND THREAD {threading.get_ident()}] generate_multilingual_tts() returned: {generated}", flush=True)
+
+        if any(generated.values()):
+            logger.info("TTS Generated")
+            with ADVISORY_LOCK:
+                LAST_ADVISORY_HASH = advisory_hash
+            return "generated"
+
+        if _all_audio_exists():
+            logger.info("Using Cached Audio")
+            with ADVISORY_LOCK:
+                LAST_ADVISORY_HASH = advisory_hash
+            return "cached"
+
+        logger.warning("No new TTS generated and no cached audio is available")
+        return "error"
+
+    except Exception as exc:
+        print(f"[BACKGROUND THREAD {threading.get_ident()}] EXCEPTION OCCURRED:", flush=True)
+        traceback.print_exc()
+        err_text = str(exc)
+        if "402" in err_text or "rate limit" in err_text.lower():
+            logger.warning("Sarvam Rate Limited: %s", err_text)
+        else:
+            logger.warning("Sarvam TTS error: %s", err_text)
+        return "error"
+    finally:
+        print(f"[BACKGROUND THREAD {threading.get_ident()}] Thread finished", flush=True)
+        _release_generation_lock(advisory_hash)
+
+
+def maybe_generate_tts(advisory, background=False):
+    global LAST_ADVISORY_HASH
+    import threading
+    print(f"[MAIN THREAD {threading.get_ident()}] maybe_generate_tts() ENTERED with background={background}", flush=True)
+
+    if advisory is None:
+        return "none"
+
+    advisory_hash = hash_advisory(advisory)
+
+    with ADVISORY_LOCK:
+        if advisory_hash == LAST_ADVISORY_HASH and _all_audio_exists():
+            logger.info("Skipped Duplicate Advisory")
+            return "same"
+        if advisory_hash == LAST_ADVISORY_HASH:
+            logger.info("Advisory unchanged but audio missing; regenerating")
+
+    if background:
+        if not _acquire_generation_lock(advisory_hash):
+            return "scheduled"
+
+        print(f"[MAIN THREAD {threading.get_ident()}] Starting background thread for TTS generation", flush=True)
+        threading.Thread(
+            target=_generate_tts_with_hash,
+            args=(advisory, advisory_hash),
+            daemon=True,
+        ).start()
+        print(f"[MAIN THREAD {threading.get_ident()}] Background thread started - returning 'scheduled'", flush=True)
+
+        return "scheduled"
+
+    if not _acquire_generation_lock(advisory_hash):
+        return "scheduled"
+
+    return _generate_tts_with_hash(advisory, advisory_hash)
+
+
 
 # =========================================================
 # CORE LOGIC
 # =========================================================
 
 def get_priority_junction(ambulance):
-
-    best_result = None
-    best_eta = float("inf")
-
     route_ids = ambulance.route
 
     debug_print("ROUTE =", route_ids)
@@ -591,260 +678,144 @@ def get_priority_junction(ambulance):
     debug_print("ROUTE LENGTH =", len(route_ids))
 
     if not route_ids:
-        print("ERROR: No route found")
+        logger.warning("No route found for ambulance %s", ambulance.ambulance_id)
         return {
             "status": "no_route",
             "junction": None
         }
 
-    # Always target first active junction
     target_junction_id = route_ids[0]
+    junction = next(
+        (j for j in JUNCTIONS if j["junction_id"] == target_junction_id),
+        None,
+    )
 
-    for junction in JUNCTIONS:
+    if junction is None:
+        logger.warning("Target junction not found: %s", target_junction_id)
+        return {
+            "status": "no_route",
+            "junction": None
+     }
 
-        if junction["junction_id"] != target_junction_id:
-            continue
+    debug_print("CHECKING:", junction["junction_id"])
 
-        debug_print("CHECKING:", junction["junction_id"])
+    distance = get_distance_km(
+        ambulance.latitude,
+        ambulance.longitude,
+        junction["latitude"],
+        junction["longitude"],
+    )
 
-        distance = get_distance_km(
-            ambulance.latitude,
-            ambulance.longitude,
-            junction["latitude"],
-            junction["longitude"]
-        )
+    debug_print(
+        f"DISTANCE TO {junction['junction_id']} = "
+        f"{round(distance, 3)} km"
+    )
 
-        debug_print(
-            f"DISTANCE TO {junction['junction_id']} = "
-            f"{round(distance, 3)} km"
-        )
-
-        # Skip already crossed junction
-        if distance < 0.02:
-
-            if len(route_ids) == 1:
-                distance = 0.02
-            else:
-                debug_print("JUNCTION ALREADY CROSSED")
-                continue
-
-        eta = calculate_eta(
-            distance,
-            ambulance.speed_kmph
-        )
-
-        current_index = route_ids.index(
-            junction["junction_id"]
-        )
-
-        if current_index < len(route_ids) - 1:
-
-            next_junction_id = route_ids[
-                current_index + 1
-            ]
-
-            next_junction = next(
-                j for j in JUNCTIONS
-                if j["junction_id"] == next_junction_id
-            )
-
-            direction = get_route_direction(
-                junction,
-                next_junction
-            )
-
-            debug_print("\n====================")
-            debug_print("CURRENT:", junction["junction_id"])
-            debug_print("NEXT:", next_junction["junction_id"])
-            debug_print("DIRECTION:", direction)
-            debug_print("====================\n")
-
+    if distance < 0.02:
+        if len(route_ids) == 1:
+            distance = 0.02
         else:
+            debug_print("JUNCTION ALREADY CROSSED")
+            return {
+                "status": "no_route",
+                "junction": None
+            }
 
-            if current_index > 0:
+    eta = calculate_eta(
+        distance,
+        ambulance.speed_kmph,
+    )
 
-                previous_junction_id = route_ids[
-                    current_index - 1
-                ]
+    if len(route_ids) > 1:
+        next_junction_id = route_ids[1]
+        next_junction = next(
+            j for j in JUNCTIONS
+            if j["junction_id"] == next_junction_id
+        )
 
-                previous_junction = next(
-                    j for j in JUNCTIONS
-                    if j["junction_id"] == previous_junction_id
-                )
-
-                direction = get_route_direction(
-                    previous_junction,
-                    junction
-                )
-
-            else:
-                direction = "right"
-
-        
-
-
-        # =====================================================
-        # ALL LANES
-        # =====================================================
-        all_lanes = junction["lanes"]
-
-        # =====================================================
-        # VALID LANES
-        # =====================================================
-
-        valid_lanes = filter_lanes_by_direction(
+        direction = get_route_direction(
             junction,
-            direction
+            next_junction,
         )
 
-        # =====================================================
-        # OCCUPANCY FOR ALL LANES
-        # =====================================================
-
-        lane_occupancy = {}
-
-        for lane in all_lanes:
-
-             try:
-
-                 lane_occupancy[lane["lane_id"]] = (
-
-                     get_lane_occupancy(lane)
-              )
-
-             except Exception as e:
-
-                 print("YOLO ERROR =", e)
-
-                 lane_occupancy[lane["lane_id"]] = 0
-
-        # =====================================================
-        # SELECT BEST VALID LANE
-        # =====================================================
-
-        valid_lane_counts = {}
-
-        for lane in valid_lanes:
-
-            lane_id = lane["lane_id"]
-
-            valid_lane_counts[lane_id] = (
-                lane_occupancy[lane_id]
-            )
-
-        if valid_lane_counts:
-
-            selected_lane = min(
-                valid_lane_counts.items(),
-                key=lambda x: (x[1], x[0])
-            )[0]
-
-        else:
-            selected_lane = default_direction_lane(
-                valid_lanes
-            )
-
-        # =====================================================
-        # URGENCY
-        # =====================================================
-
-        urgency = "NORMAL"
-
-
-        debug_print("LANE COUNTS =", valid_lane_counts)
-        debug_print("LANE OCCUPANCY =", lane_occupancy)
-        debug_print("VALID LANE COUNTS =", valid_lane_counts)
-
-        if valid_lane_counts and all(
-            o is not None and o >= CONGESTION_THRESHOLD
-            for o in valid_lane_counts.values()
-        ):
-            urgency = "HIGH"
-
-        # =====================================================
-        # SIGNAL ACTION
-        # =====================================================
-
-        signal_action = decide_signal_action(
-            selected_lane,
-            urgency
-        )
-
-        # =====================================================
-        # ADVISORY
-        # =====================================================
-
-        advisory = generate_advisory(
-            selected_lane,
-            eta,
-            urgency
-        )
-
-        try:
-            generate_multilingual_tts(advisory)
-        except Exception as e:
-            print("=" * 60)
-            print("TTS SKIPPED")
-            print(e)
-            print("=" * 60)
-
-        debug_print("JUNCTION:", junction["junction_id"])
-        debug_print("ETA:", eta)
+        debug_print("\n====================")
+        debug_print("CURRENT:", junction["junction_id"])
+        debug_print("NEXT:", next_junction["junction_id"])
         debug_print("DIRECTION:", direction)
-        debug_print("VALID:", [x["lane_id"] for x in valid_lanes])
-        debug_print("SELECTED:", selected_lane)
-        debug_print("-------------------")
-        
-        current_result = {
+        debug_print("====================\n")
+    else:
+        direction = "right"
 
-            "junction_id": junction["junction_id"],
+    all_lanes = junction["lanes"]
+    valid_lanes = filter_lanes_by_direction(
+        junction,
+        direction,
+    )
 
-            "location": junction["location"],
+    lane_occupancy = {}
+    for lane in all_lanes:
+        try:
+            lane_occupancy[lane["lane_id"]] = get_lane_occupancy(lane)
+        except Exception as e:
+            logger.warning("YOLO ERROR = %s", e)
+            lane_occupancy[lane["lane_id"]] = 0
 
-            "eta": int(eta),
+    valid_lane_counts = {
+        lane["lane_id"]: lane_occupancy[lane["lane_id"]]
+        for lane in valid_lanes
+    }
 
-            "ambulance_lat": ambulance.latitude,
+    if valid_lane_counts:
+        selected_lane = min(
+            valid_lane_counts.items(),
+            key=lambda x: (x[1], x[0]),
+        )[0]
+    else:
+        selected_lane = default_direction_lane(valid_lanes)
 
-            "ambulance_lon": ambulance.longitude,
+    urgency = "NORMAL"
+    debug_print("LANE COUNTS =", valid_lane_counts)
+    debug_print("LANE OCCUPANCY =", lane_occupancy)
+    debug_print("VALID LANE COUNTS =", valid_lane_counts)
 
-            "direction": direction,
+    if valid_lane_counts and all(
+        o is not None and o >= CONGESTION_THRESHOLD
+        for o in valid_lane_counts.values()
+    ):
+        urgency = "HIGH"
 
-            "valid_lanes": valid_lanes,
+    signal_action = decide_signal_action(
+        selected_lane,
+        urgency,
+    )
 
-            "lane_occupancy": lane_occupancy,
+    advisory = generate_advisory(
+        selected_lane,
+        eta,
+        urgency,
+    )
 
-            "selected_lane": selected_lane,
+    debug_print("JUNCTION:", junction["junction_id"])
+    debug_print("ETA:", eta)
+    debug_print("DIRECTION:", direction)
+    debug_print("VALID:", [x["lane_id"] for x in valid_lanes])
+    debug_print("SELECTED:", selected_lane)
+    debug_print("-------------------")
 
-            "urgency": urgency,
-
-            "signal_action": signal_action,
-
-            "advisory": advisory
-        }
-
-        # =====================================================
-        # INCIDENT REPORT
-        # =====================================================
-
-
-        # =====================================================
-        # NEAREST JUNCTION
-        # =====================================================
-
-        if eta < best_eta:
-
-            best_eta = eta
-
-            best_result = current_result
-
-            debug_print(
-                "CURRENT BEST:",
-                best_result["junction_id"]
-            )
-
-    
-
-    return best_result
+    return {
+        "junction_id": junction["junction_id"],
+        "location": junction["location"],
+        "eta": int(eta),
+        "ambulance_lat": ambulance.latitude,
+        "ambulance_lon": ambulance.longitude,
+        "direction": direction,
+        "valid_lanes": valid_lanes,
+        "lane_occupancy": lane_occupancy,
+        "selected_lane": selected_lane,
+        "urgency": urgency,
+        "signal_action": signal_action,
+        "advisory": advisory,
+    }
 
 
 # =========================================================
@@ -888,6 +859,14 @@ def priority_junction(ambulance_id: str):
             "status": "no junction found"
         }
 
+    tts_status = maybe_generate_tts(result.get("advisory"), background=True)
+    if tts_status in {"same", "cached"}:
+        logger.info("Using Cached Audio")
+    elif tts_status == "scheduled":
+        logger.info("TTS generation scheduled")
+    elif tts_status == "error":
+        logger.info("TTS unavailable")
+
     return result
 
 
@@ -911,7 +890,7 @@ def incident_report(ambulance_id: str):
 @app.get("/audio/advisory.mp3")
 def get_advisory_audio():
     return FileResponse(
-        "backend/audio/advisory.mp3",
+        os.path.join(AUDIO_DIR, "advisory.mp3"),
         media_type="audio/mpeg"
     )
 
@@ -919,7 +898,7 @@ def get_advisory_audio():
 @app.get("/audio/advisory_tamil.mp3")
 def get_advisory_tamil_audio():
     return FileResponse(
-        "backend/audio/advisory_tamil.mp3",
+        os.path.join(AUDIO_DIR, "advisory_tamil.mp3"),
         media_type="audio/mpeg"
     )
 
@@ -927,7 +906,7 @@ def get_advisory_tamil_audio():
 @app.get("/audio/advisory_english.mp3")
 def get_advisory_english_audio():
     return FileResponse(
-        "backend/audio/advisory_english.mp3",
+        os.path.join(AUDIO_DIR, "advisory_english.mp3"),
         media_type="audio/mpeg"
     )
 
@@ -935,7 +914,7 @@ def get_advisory_english_audio():
 @app.get("/audio/advisory_hindi.mp3")
 def get_advisory_hindi_audio():
     return FileResponse(
-        "backend/audio/advisory_hindi.mp3",
+        os.path.join(AUDIO_DIR, "advisory_hindi.mp3"),
         media_type="audio/mpeg"
     )
 # =========================================================
