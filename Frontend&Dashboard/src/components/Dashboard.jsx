@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 import MapView from './MapView';
 import LiveLaneVisualizer from './LiveLaneVisualizer';
@@ -6,8 +6,52 @@ import AIDecisionFeed from './AIDecisionFeed';
 import SignalIntersection from './SignalIntersection';
 import IncidentReport from './IncidentReport';
 import AdvisoryPanel from './AdvisoryPanel';
+import AIVisionPanel from './AIVisionPanel';
+import MissionComplete from './MissionComplete';
 
-// Helper function to format ETA
+// Custom hook for smooth ETA countdown
+const useETACountdown = (targetETA) => {
+  const [displayETA, setDisplayETA] = useState(targetETA || 0);
+  const lastUpdateRef = useRef(Date.now());
+  const animationRef = useRef(null);
+
+  useEffect(() => {
+    if (targetETA == null) {
+      setDisplayETA(0);
+      return;
+    }
+
+    // Set initial value
+    setDisplayETA(targetETA);
+    lastUpdateRef.current = Date.now();
+
+    // Countdown animation
+    const animate = () => {
+      const now = Date.now();
+      const elapsed = (now - lastUpdateRef.current) / 1000; // seconds elapsed
+      
+      setDisplayETA((prev) => {
+        const newETA = Math.max(0, prev - elapsed);
+        lastUpdateRef.current = now;
+        return newETA;
+      });
+
+      animationRef.current = requestAnimationFrame(animate);
+    };
+
+    animationRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [targetETA]);
+
+  return displayETA;
+};
+
+// Helper function to format ETA in MM:SS
 const formatETA = (seconds) => {
   if (!seconds || seconds <= 0) return 'calculating';
   const mins = Math.floor(seconds / 60);
@@ -15,11 +59,60 @@ const formatETA = (seconds) => {
   return `${mins}m ${secs}s`;
 };
 
+// Helper function to format ETA as digital countdown MM:SS
+const formatETADigital = (seconds) => {
+  if (seconds == null || isNaN(seconds) || seconds <= 0) return '00:00';
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+};
+
 const Dashboard = ({
   junctionData,
   loading,
   connectionStatus
 }) => {
+
+  // Use smooth countdown for ETA
+  const smoothETA = useETACountdown(junctionData?.eta);
+
+  // Mission completion state
+  const [missionComplete, setMissionComplete] = useState(false);
+  const [missionStartTime, setMissionStartTime] = useState(null);
+  const [travelTime, setTravelTime] = useState(0);
+  const previousETARef = useRef(null);
+
+  // Track mission start
+  useEffect(() => {
+    if (junctionData && !missionStartTime) {
+      setMissionStartTime(Date.now());
+    }
+  }, [junctionData, missionStartTime]);
+
+  // Detect mission completion (ETA reaches 0)
+  useEffect(() => {
+    if (junctionData?.eta !== null && junctionData?.eta !== undefined) {
+      // Mission completes when ETA goes from >0 to <=0
+      if (previousETARef.current > 0 && junctionData.eta <= 0 && !missionComplete) {
+        const calculatedTravelTime = missionStartTime 
+          ? Math.floor((Date.now() - missionStartTime) / 1000)
+          : 0;
+        setTravelTime(calculatedTravelTime);
+        setMissionComplete(true);
+      }
+      previousETARef.current = junctionData.eta;
+    }
+  }, [junctionData?.eta, missionComplete, missionStartTime]);
+
+  // Reset mission state when emergency ends
+  useEffect(() => {
+    if (!junctionData) {
+      setMissionComplete(false);
+      setMissionStartTime(null);
+      setTravelTime(0);
+      previousETARef.current = null;
+    }
+  }, [junctionData]);
 
   // =====================================================
   // SAFE FLAGS
@@ -58,7 +151,7 @@ const Dashboard = ({
   // =====================================================
 
   const eta =
-    junctionData?.eta ?? 0;
+    smoothETA || 0;
 
 
   const etaClass =
@@ -117,9 +210,10 @@ const Dashboard = ({
             {isEmergencyActive && (
               <div className="sidebar-section eta-section">
                 <div className="sidebar-label">EMERGENCY ETA</div>
-                <div className={`sidebar-eta ${etaClass}`}>
-                  {formatETA(junctionData?.eta)}
+                <div className={`sidebar-eta-digital ${etaClass}`}>
+                  {formatETADigital(eta)}
                 </div>
+                <div className="sidebar-eta-label">MIN : SEC</div>
                 <div className="sidebar-status">
                   {junctionData?.urgency === 'HIGH' ? '🔴 CRITICAL' : '🟢 ACTIVE'}
                 </div>
@@ -310,6 +404,13 @@ const Dashboard = ({
             junctionData={junctionData}
           />
 
+          {/* AI VISION PANEL - YOLO DETECTION RESULTS */}
+
+          <AIVisionPanel
+            laneOccupancy={junctionData?.lane_occupancy || {}}
+            isActive={isEmergencyActive}
+          />
+
           {/* SIGNAL INTERSECTION VISUAL */}
 
           {junctionData?.selected_lane && (
@@ -334,6 +435,14 @@ const Dashboard = ({
         </div>
 
       </div>
+
+      {/* Mission Complete Overlay */}
+      {missionComplete && (
+        <MissionComplete
+          travelTime={travelTime}
+          onDismiss={() => setMissionComplete(false)}
+        />
+      )}
 
     </div>
 
